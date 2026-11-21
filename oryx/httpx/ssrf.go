@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"time"
 
 	"github.com/gobwas/glob"
@@ -24,19 +25,36 @@ type noInternalIPRoundTripper struct {
 	internalIPExceptions        []string
 }
 
-// RoundTrip implements http.RoundTripper.
-func (n noInternalIPRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	incoming := IncomingRequestURL(request)
-	incoming.RawQuery = ""
-	incoming.RawFragment = ""
-	for _, exception := range n.internalIPExceptions {
+// IsInternalIPExceptionURL reports whether targetURL matches any configured
+// internal IP exception glob using the same URL normalization as the SSRF transport.
+func IsInternalIPExceptionURL(targetURL *url.URL, exceptions []string) (bool, error) {
+	if targetURL == nil || len(exceptions) == 0 {
+		return false, nil
+	}
+	normalized := *targetURL
+	normalized.RawQuery = ""
+	normalized.RawFragment = ""
+	candidate := normalized.String()
+	for _, exception := range exceptions {
 		compiled, err := glob.Compile(exception, '.', '/')
 		if err != nil {
-			return nil, err
+			return false, err
 		}
-		if compiled.Match(incoming.String()) {
-			return n.onWhitelist.RoundTrip(request)
+		if compiled.Match(candidate) {
+			return true, nil
 		}
+	}
+	return false, nil
+}
+
+// RoundTrip implements http.RoundTripper.
+func (n noInternalIPRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	allowed, err := IsInternalIPExceptionURL(IncomingRequestURL(request), n.internalIPExceptions)
+	if err != nil {
+		return nil, err
+	}
+	if allowed {
+		return n.onWhitelist.RoundTrip(request)
 	}
 
 	return n.notOnWhitelist.RoundTrip(request)

@@ -337,6 +337,87 @@ func TestValidateIPRanges(t *testing.T) {
 	require.NoError(t, v.ValidateDynamicRegistration(ctx, &Client{RequestURIs: []string{"https://google", "https://localhost:1234"}}))
 }
 
+func TestValidatePrivateIPExceptions(t *testing.T) {
+	ctx := t.Context()
+	const jwksURL = "http://127.0.0.1:8080/.well-known/jwks.json"
+	const logoutURL = "http://127.0.0.1:8080/backchannel-logout"
+	const unexemptURL = "http://127.0.0.1:9090/.well-known/jwks.json"
+
+	requireMetadataHint := func(t *testing.T, err error, expectedField string) *fosite.RFC6749Error {
+		t.Helper()
+		require.ErrorContains(t, err, "invalid_client_metadata")
+		var rfcErr *fosite.RFC6749Error
+		require.ErrorAs(t, err, &rfcErr)
+		require.Contains(t, rfcErr.HintField, expectedField)
+		return rfcErr
+	}
+
+	t.Run("rejects private jwks_uri when no exceptions are configured", func(t *testing.T) {
+		reg := testhelpers.NewRegistryMemory(t)
+		v := NewValidator(reg)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
+
+		err := v.Validate(ctx, &Client{
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JSONWebKeysURI:          jwksURL,
+		})
+		requireMetadataHint(t, err, "jwks_uri")
+	})
+
+	t.Run("accepts private jwks_uri listed in private_ip_exception_urls", func(t *testing.T) {
+		reg := testhelpers.NewRegistryMemory(t)
+		v := NewValidator(reg)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{jwksURL})
+
+		c := &Client{
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JSONWebKeysURI:          jwksURL,
+		}
+		require.NoError(t, v.Validate(ctx, c))
+		require.Equal(t, jwksURL, c.JSONWebKeysURI)
+		require.NoError(t, v.ValidateDynamicRegistration(ctx, &Client{
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JSONWebKeysURI:          jwksURL,
+		}))
+	})
+
+	t.Run("rejects unexempted private jwks_uri even when backchannel_logout_uri is excepted", func(t *testing.T) {
+		reg := testhelpers.NewRegistryMemory(t)
+		v := NewValidator(reg)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{logoutURL})
+
+		err := v.Validate(ctx, &Client{
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JSONWebKeysURI:          jwksURL,
+			BackChannelLogoutURI:    logoutURL,
+		})
+		rfcErr := requireMetadataHint(t, err, "jwks_uri")
+		require.NotContains(t, rfcErr.HintField, "backchannel_logout_uri")
+	})
+
+	t.Run("rejects client update adding a new private URI outside exception list", func(t *testing.T) {
+		reg := testhelpers.NewRegistryMemory(t)
+		v := NewValidator(reg)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
+		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{jwksURL})
+
+		c := &Client{
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JSONWebKeysURI:          jwksURL,
+		}
+		require.NoError(t, v.Validate(ctx, c))
+
+		c.JSONWebKeysURI = unexemptURL
+		requireMetadataHint(t, v.Validate(ctx, c), "jwks_uri")
+
+		c.JSONWebKeysURI = jwksURL
+		c.RequestURIs = []string{unexemptURL}
+		requireMetadataHint(t, v.Validate(ctx, c), "request_uris.0")
+	})
+}
+
 func TestValidateDynamicRegistration(t *testing.T) {
 	reg := testhelpers.NewRegistryMemory(t, driver.WithConfigOptions(configx.WithValues(map[string]any{
 		config.KeySubjectTypesSupported: []string{"pairwise", "public"},
