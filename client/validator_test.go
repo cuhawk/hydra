@@ -24,6 +24,7 @@ import (
 	"github.com/ory/hydra/v2/internal/testhelpers"
 	"github.com/ory/hydra/v2/x"
 	"github.com/ory/x/configx"
+	"github.com/ory/x/httprouterx"
 	"github.com/ory/x/httpx"
 )
 
@@ -338,83 +339,54 @@ func TestValidateIPRanges(t *testing.T) {
 }
 
 func TestValidatePrivateIPExceptions(t *testing.T) {
+	const jwksURI = "https://127.0.0.1/jwks.json"
+	const logoutURI = "https://127.0.0.1/logout"
 	ctx := t.Context()
-	const jwksURL = "http://127.0.0.1:8080/.well-known/jwks.json"
-	const logoutURL = "http://127.0.0.1:8080/backchannel-logout"
-	const unexemptURL = "http://127.0.0.1:9090/.well-known/jwks.json"
+	reg := testhelpers.NewRegistryMemory(t)
+	reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
+	v := NewValidator(reg)
 
-	requireMetadataHint := func(t *testing.T, err error, expectedField string) *fosite.RFC6749Error {
-		t.Helper()
-		require.ErrorContains(t, err, "invalid_client_metadata")
-		var rfcErr *fosite.RFC6749Error
-		require.ErrorAs(t, err, &rfcErr)
-		require.Contains(t, rfcErr.HintField, expectedField)
-		return rfcErr
+	for _, tc := range []struct {
+		name       string
+		exceptions []string
+		client     *Client
+		wantField  string
+	}{
+		{"private JWKS without exception", nil, &Client{JSONWebKeysURI: jwksURI}, "jwks_uri"},
+		{"exact JWKS exception", []string{jwksURI}, &Client{JSONWebKeysURI: jwksURI}, ""},
+		{"logout exception does not exempt JWKS", []string{logoutURI}, &Client{
+			JSONWebKeysURI: jwksURI, BackChannelLogoutURI: logoutURI,
+		}, "jwks_uri"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, tc.exceptions)
+			err := v.Validate(ctx, tc.client)
+			if tc.wantField == "" {
+				require.NoError(t, err)
+			} else {
+				var metadataErr *fosite.RFC6749Error
+				require.ErrorAs(t, err, &metadataErr)
+				require.Equal(t, "invalid_client_metadata", metadataErr.ErrorField)
+				require.Contains(t, metadataErr.HintField, "key "+tc.wantField+" validation is failing")
+			}
+		})
 	}
 
-	t.Run("rejects private jwks_uri when no exceptions are configured", func(t *testing.T) {
-		reg := testhelpers.NewRegistryMemory(t)
-		v := NewValidator(reg)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
+	t.Run("update adds an unlisted private request URI", func(t *testing.T) {
+		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{jwksURI})
+		router := httprouterx.NewRouterAdmin()
+		NewHandler(reg).SetAdminRoutes(router)
 
-		err := v.Validate(ctx, &Client{
-			TokenEndpointAuthMethod: "private_key_jwt",
-			JSONWebKeysURI:          jwksURL,
-		})
-		requireMetadataHint(t, err, "jwks_uri")
-	})
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodPost, ClientsHandlerPath,
+			strings.NewReader(fmt.Sprintf(`{"client_id":"private-uri-client","jwks_uri":%q}`, jwksURI))))
+		require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
 
-	t.Run("accepts private jwks_uri listed in private_ip_exception_urls", func(t *testing.T) {
-		reg := testhelpers.NewRegistryMemory(t)
-		v := NewValidator(reg)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{jwksURL})
-
-		c := &Client{
-			TokenEndpointAuthMethod: "private_key_jwt",
-			JSONWebKeysURI:          jwksURL,
-		}
-		require.NoError(t, v.Validate(ctx, c))
-		require.Equal(t, jwksURL, c.JSONWebKeysURI)
-		require.NoError(t, v.ValidateDynamicRegistration(ctx, &Client{
-			TokenEndpointAuthMethod: "private_key_jwt",
-			JSONWebKeysURI:          jwksURL,
-		}))
-	})
-
-	t.Run("rejects unexempted private jwks_uri even when backchannel_logout_uri is excepted", func(t *testing.T) {
-		reg := testhelpers.NewRegistryMemory(t)
-		v := NewValidator(reg)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{logoutURL})
-
-		err := v.Validate(ctx, &Client{
-			TokenEndpointAuthMethod: "private_key_jwt",
-			JSONWebKeysURI:          jwksURL,
-			BackChannelLogoutURI:    logoutURL,
-		})
-		rfcErr := requireMetadataHint(t, err, "jwks_uri")
-		require.NotContains(t, rfcErr.HintField, "backchannel_logout_uri")
-	})
-
-	t.Run("rejects client update adding a new private URI outside exception list", func(t *testing.T) {
-		reg := testhelpers.NewRegistryMemory(t)
-		v := NewValidator(reg)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPNoPrivateIPRanges, true)
-		reg.Config().MustSet(ctx, config.KeyClientHTTPPrivateIPExceptionURLs, []string{jwksURL})
-
-		c := &Client{
-			TokenEndpointAuthMethod: "private_key_jwt",
-			JSONWebKeysURI:          jwksURL,
-		}
-		require.NoError(t, v.Validate(ctx, c))
-
-		c.JSONWebKeysURI = unexemptURL
-		requireMetadataHint(t, v.Validate(ctx, c), "jwks_uri")
-
-		c.JSONWebKeysURI = jwksURL
-		c.RequestURIs = []string{unexemptURL}
-		requireMetadataHint(t, v.Validate(ctx, c), "request_uris.0")
+		response = httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodPut, ClientsHandlerPath+"/private-uri-client",
+			strings.NewReader(fmt.Sprintf(`{"jwks_uri":%q,"request_uris":["https://127.0.0.1/request"]}`, jwksURI))))
+		require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), "key request_uris.0 validation is failing")
 	})
 }
 

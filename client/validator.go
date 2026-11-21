@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -76,40 +77,41 @@ func (v *Validator) Validate(ctx context.Context, c *Client) error {
 	}
 
 	if v.r.Config().ClientHTTPNoPrivateIPRanges() {
-		exceptions := v.r.Config().ClientHTTPPrivateIPExceptionURLs()
 		values := map[string]string{}
-		addIfNotExempt := func(key, raw string) error {
-			if raw == "" {
-				return nil
-			}
-			exempt, err := isPrivateIPException(raw, exceptions)
-			if err != nil {
-				return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Client IP address exception check failed for %s: %s", key, err))
-			}
-			if !exempt {
-				values[key] = raw
-			}
-			return nil
+		if c.JSONWebKeysURI != "" {
+			values["jwks_uri"] = c.JSONWebKeysURI
 		}
-		if err := addIfNotExempt("jwks_uri", c.JSONWebKeysURI); err != nil {
-			return err
+		if c.BackChannelLogoutURI != "" {
+			values["backchannel_logout_uri"] = c.BackChannelLogoutURI
 		}
-		if err := addIfNotExempt("backchannel_logout_uri", c.BackChannelLogoutURI); err != nil {
-			return err
+		if c.SectorIdentifierURI != "" {
+			values["sector_identifier_uri"] = c.SectorIdentifierURI
 		}
-		if err := addIfNotExempt("sector_identifier_uri", c.SectorIdentifierURI); err != nil {
-			return err
-		}
-		for k, reqURI := range c.RequestURIs {
-			if err := addIfNotExempt(fmt.Sprintf("request_uris.%d", k), reqURI); err != nil {
-				return err
+
+		for k, v := range c.RequestURIs {
+			if v != "" {
+				values[fmt.Sprintf("request_uris.%d", k)] = v
 			}
 		}
 
-		if len(values) > 0 {
-			if err := ipx.AreAllAssociatedIPsAllowed(ctx, values); err != nil {
-				return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Client IP address is not allowed: %s", err))
+		if exceptions := v.r.Config().ClientHTTPPrivateIPExceptionURLs(); len(exceptions) > 0 {
+			for field, uri := range values {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
+				if err != nil || req.URL.Host == "" || (req.URL.Scheme != "http" && req.URL.Scheme != "https") {
+					continue
+				}
+				matches, err := httpx.MatchesInternalIPException(req, exceptions)
+				if err != nil {
+					return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Client IP address is not allowed: key %s validation is failing: %s", field, err))
+				}
+				if matches {
+					delete(values, field)
+				}
 			}
+		}
+
+		if err := ipx.AreAllAssociatedIPsAllowed(ctx, values); err != nil {
+			return errors.WithStack(ErrInvalidClientMetadata.WithHintf("Client IP address is not allowed: %s", err))
 		}
 	}
 
@@ -293,15 +295,4 @@ func (v *Validator) ValidateSectorIdentifierURL(ctx context.Context, location st
 	}
 
 	return nil
-}
-
-func isPrivateIPException(raw string, exceptions []string) (bool, error) {
-	if len(exceptions) == 0 {
-		return false, nil
-	}
-	u, err := url.ParseRequestURI(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return false, nil
-	}
-	return httpx.IsInternalIPExceptionURL(u, exceptions)
 }
